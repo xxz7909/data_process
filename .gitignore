@@ -5,6 +5,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.paddle_test_env/
 venv/
 env/
 
@@ -24,6 +25,10 @@ dist/
 # Generated outputs
 result.xlsx
 *.log
+*.tmp
+
+# Local comparison / scratch scripts
+
 
 # OS files
 .DS_Store
