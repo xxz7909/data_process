@@ -5,6 +5,7 @@
 """
 import os
 import re
+import logging
 import numpy as np
 from PIL import Image
 from rapidocr_onnxruntime import RapidOCR
@@ -12,12 +13,12 @@ import pandas as pd
 
 
 def create_ocr():
-    """创建OCR实例"""
+    """创建RapidOCR实例（基于PP-OCRv4 ONNX模型）"""
     return RapidOCR()
 
 
 def load_image(path, max_width=1200):
-    """加载图片并限制宽度以加速OCR"""
+    """加载图片并限制宽度以加速OCR，返回RGB numpy数组"""
     img = Image.open(path)
     if img.width > max_width:
         ratio = max_width / img.width
@@ -32,22 +33,109 @@ def ocr_image(ocr_engine, path):
     img_arr = load_image(path)
     result, _ = ocr_engine(img_arr)
     if result:
-        return [line[1] for line in result]
+        return [item[1] for item in result]
     return []
 
 
-def extract_diff(lines):
-    """从差额图片中提取差额(亿)数值"""
+def ocr_image_with_boxes(ocr_engine, path):
+    """OCR识别图片，返回 [(text, box, confidence), ...] 及原始图片数组"""
+    img_arr = load_image(path)
+    result, _ = ocr_engine(img_arr)
+    items = []
+    if result:
+        for item in result:
+            box = item[0]          # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            text = item[1]
+            conf = item[2]
+            items.append((text, box, conf))
+    return items, img_arr
+
+
+def _normalize_minus(text):
+    """将各种减号/破折号统一为半角减号"""
+    for ch in '一—–−﹣':
+        text = text.replace(ch, '-')
+    # 全角减号
+    text = text.replace('\uff0d', '-')
+    return text
+
+
+def _detect_text_color(img_arr, box):
+    """
+    检测文本框内文字的主色调，判断红/绿。
+    返回: 'red', 'green', 或 'unknown'
+    """
+    pts = np.array(box, dtype=np.int32)
+    x_min, y_min = pts.min(axis=0)
+    x_max, y_max = pts.max(axis=0)
+    # 裁剪区域（边界保护）
+    h, w = img_arr.shape[:2]
+    x_min, y_min = max(0, x_min), max(0, y_min)
+    x_max, y_max = min(w, x_max), min(h, y_max)
+    crop = img_arr[y_min:y_max, x_min:x_max]
+    if crop.size == 0:
+        return 'unknown'
+
+    # 转到float处理
+    pixels = crop.reshape(-1, 3).astype(np.float32)
+    r, g, b = pixels[:, 0], pixels[:, 1], pixels[:, 2]
+
+    # 过滤掉背景色（接近白色或接近黑色的像素）
+    brightness = (r + g + b) / 3
+    mask = (brightness > 30) & (brightness < 230)
+    if mask.sum() < 10:
+        return 'unknown'
+    r, g, b = r[mask], g[mask], b[mask]
+
+    # 红色像素：R 通道显著高于 G 和 B
+    red_mask = (r > 120) & (r > g * 1.4) & (r > b * 1.4)
+    # 绿色像素：G 通道显著高于 R 和 B
+    green_mask = (g > 120) & (g > r * 1.4) & (g > b * 1.4)
+
+    red_ratio = red_mask.sum() / len(r)
+    green_ratio = green_mask.sum() / len(r)
+
+    if green_ratio > 0.05 and green_ratio > red_ratio:
+        return 'green'
+    elif red_ratio > 0.05 and red_ratio > green_ratio:
+        return 'red'
+    return 'unknown'
+
+
+def extract_diff(lines, ocr_items=None, img_arr=None):
+    """从差额图片中提取差额(亿)数值，支持正负号检测。
+
+    OCR文本格式示例：
+      "亿：-14.12差额亿：90.55 著名游资低"
+      "-5.35差额亿：16.37著名游资低吸：0"
+    其中第一个数值（可能为负）是差额，"差额亿：XX"后的值是另一个指标。
+    """
     text = ''.join(lines)
-    # 匹配 "差额亿：XX.XX" 或 "差额亿:XX.XX"
-    match = re.search(r'差额亿[：:]\s*([\d.]+)', text)
-    if match:
-        return match.group(1)
-    # 备用：匹配任何 X.XX 后跟 著名
-    match = re.search(r'([\d.]+)\s*著名', text)
-    if match:
-        return match.group(1)
-    return ''
+    text = _normalize_minus(text)
+
+    # 策略：提取文本中**第一个**浮点数（可能带负号），这就是差额值
+    match = re.search(r'(-?\d+\.?\d*)', text)
+    if not match:
+        return ''
+
+    value_str = match.group(1)
+    has_text_minus = value_str.startswith('-')
+
+    # 颜色检测仅作为补充：当OCR文本没有负号时，用颜色判断是否为负值
+    # 当OCR文本已有负号时，信任OCR结果（不让颜色覆盖）
+    if not has_text_minus and ocr_items and img_arr is not None:
+        color = 'unknown'
+        for item_text, box, _ in ocr_items:
+            normalized = _normalize_minus(item_text)
+            if value_str in normalized:
+                color = _detect_text_color(img_arr, box)
+                if color != 'unknown':
+                    break
+        # 绿色=负值，补加负号
+        if color == 'green':
+            value_str = '-' + value_str
+
+    return value_str
 
 
 def _is_valid_stock_code(code_str):
@@ -97,8 +185,10 @@ def extract_code_and_name(lines):
             code = code_match.group(1)
 
     # 提取股票名称（中文字符，可能带 -U, -UW 等后缀）
-    # 排除常见干扰词
-    noise_words = {'决策', '传统', '交易', '亮点', '特色', '涨停', '跌停'}
+    # 排除常见干扰词（含UI界面噪声文字）
+    noise_words = {'决策', '传统', '交易', '亮点', '特色', '涨停', '跌停',
+                   '盘面', '资金', '主力', '散户', '买入', '卖出', '成交',
+                   '板块', '行情', '分时', '日线', '周线', '月线', '指标'}
     # OCR末尾常见噪声字符（仅中文单字噪声）
     trailing_noise = set('高托拉上下')
     name = ''
@@ -122,11 +212,11 @@ def extract_code_and_name(lines):
 
 
 def extract_market_cap(lines):
-    """从市值图片中提取总市值（带单位）"""
+    """从市值图片中提取总市值（纯数值，已去除'亿'和逗号）"""
     full_text = '\n'.join(lines)
 
     # 找到所有带"亿"的数值
-    values = re.findall(r'([\d,.]+亿)', full_text)
+    values = re.findall(r'([\d,.]+)亿', full_text)
     if not values:
         return ''
 
@@ -134,12 +224,12 @@ def extract_market_cap(lines):
     max_val = ''
     max_num = 0
     for v in values:
-        num_str = v.replace('亿', '').replace(',', '')
+        num_str = v.replace(',', '')
         try:
             num = float(num_str)
             if num > max_num:
                 max_num = num
-                max_val = v
+                max_val = num_str
         except ValueError:
             continue
 
@@ -181,15 +271,16 @@ def process_images(img_dir, output_path, progress_callback=None):
     for i in range(1, group_count + 1):
         step_base = (i - 1) * 3
 
-        # --- 差额 ---
+        # --- 差额（使用带坐标的OCR结果+颜色检测） ---
         diff_path = os.path.join(img_dir, f'{i}_差额.png.bmp')
         diff_value = ''
         if os.path.exists(diff_path):
             if progress_callback:
                 progress_callback(step_base + 1, total_steps, f'正在识别 第{i}组 差额...')
             try:
-                lines = ocr_image(ocr_engine, diff_path)
-                diff_value = extract_diff(lines)
+                ocr_items, img_arr = ocr_image_with_boxes(ocr_engine, diff_path)
+                lines = [item[0] for item in ocr_items]
+                diff_value = extract_diff(lines, ocr_items, img_arr)
             except Exception as e:
                 diff_value = f'识别失败: {e}'
 
