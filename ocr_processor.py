@@ -102,40 +102,93 @@ def _detect_text_color(img_arr, box):
     return 'unknown'
 
 
+def _approximate_sub_box(text, box, start_idx, end_idx):
+    """按字符位置估算子串对应的文本框区域，用于目标数值的颜色检测。"""
+    pts = np.array(box, dtype=np.int32)
+    x_min, y_min = pts.min(axis=0)
+    x_max, y_max = pts.max(axis=0)
+    text_len = max(len(text), 1)
+
+    sub_x_min = x_min + int((x_max - x_min) * start_idx / text_len)
+    sub_x_max = x_min + int((x_max - x_min) * end_idx / text_len)
+    if sub_x_max <= sub_x_min:
+        sub_x_max = min(x_max, sub_x_min + max(1, (x_max - x_min) // text_len))
+
+    return np.array([
+        [sub_x_min, y_min],
+        [sub_x_max, y_min],
+        [sub_x_max, y_max],
+        [sub_x_min, y_max],
+    ], dtype=np.int32)
+
+
+def _extract_signed_value(value_str, text_segment, box=None, img_arr=None):
+    """优先信任OCR文本中的正负号，缺失时再谨慎使用颜色补负号。"""
+    if value_str.startswith(('+', '-')):
+        return value_str
+
+    if box is None or img_arr is None:
+        return value_str
+
+    start_idx = text_segment.find(value_str)
+    if start_idx < 0:
+        return value_str
+
+    sub_box = _approximate_sub_box(text_segment, box, start_idx, start_idx + len(value_str))
+    color = _detect_text_color(img_arr, sub_box)
+    if color == 'green':
+        return '-' + value_str
+    return value_str
+
+
+def _extract_diff_from_text(text, box=None, img_arr=None):
+    """优先提取“差额亿:”后的数值，必要时回退到第一个数值。"""
+    patterns = [
+        r'差额亿\s*[：:]\s*([+-]?\d+(?:\.\d+)?)',
+        r'差额\s*[：:]\s*([+-]?\d+(?:\.\d+)?)',
+        r'差额亿\s*([+-]?\d+(?:\.\d+)?)',
+        r'差额\s*([+-]?\d+(?:\.\d+)?)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            value_str = match.group(1)
+            return _extract_signed_value(value_str, text, box, img_arr)
+
+    fallback = re.search(r'([+-]?\d+(?:\.\d+)?)', text)
+    if not fallback:
+        return ''
+    value_str = fallback.group(1)
+    return _extract_signed_value(value_str, text, box, img_arr)
+
+
 def extract_diff(lines, ocr_items=None, img_arr=None):
-    """从差额图片中提取差额(亿)数值，支持正负号检测。
+    """从差额图片中提取差额(亿)数值，优先取“差额亿:”后的目标值。
 
     OCR文本格式示例：
       "亿：-14.12差额亿：90.55 著名游资低"
       "-5.35差额亿：16.37著名游资低吸：0"
-    其中第一个数值（可能为负）是差额，"差额亿：XX"后的值是另一个指标。
+      "亿：-867.90差额亿：-420.19著名游"
+    优先提取 "差额亿：XX" 后的值；只有标签缺失时才回退到首个数值。
     """
-    text = ''.join(lines)
-    text = _normalize_minus(text)
+    normalized_lines = [_normalize_minus(line) for line in lines]
 
-    # 策略：提取文本中**第一个**浮点数（可能带负号），这就是差额值
-    match = re.search(r'(-?\d+\.?\d*)', text)
-    if not match:
-        return ''
+    if ocr_items:
+        normalized_items = [(_normalize_minus(text), box, conf) for text, box, conf in ocr_items]
+        for idx, (item_text, box, _) in enumerate(normalized_items):
+            value = _extract_diff_from_text(item_text, box, img_arr)
+            if '差额' in item_text and value:
+                return value
 
-    value_str = match.group(1)
-    has_text_minus = value_str.startswith('-')
+            if re.search(r'差额亿?\s*[：:]?\s*$', item_text):
+                for next_text, next_box, _ in normalized_items[idx + 1:idx + 3]:
+                    value = _extract_diff_from_text(next_text, next_box, img_arr)
+                    if value:
+                        return value
 
-    # 颜色检测仅作为补充：当OCR文本没有负号时，用颜色判断是否为负值
-    # 当OCR文本已有负号时，信任OCR结果（不让颜色覆盖）
-    if not has_text_minus and ocr_items and img_arr is not None:
-        color = 'unknown'
-        for item_text, box, _ in ocr_items:
-            normalized = _normalize_minus(item_text)
-            if value_str in normalized:
-                color = _detect_text_color(img_arr, box)
-                if color != 'unknown':
-                    break
-        # 绿色=负值，补加负号
-        if color == 'green':
-            value_str = '-' + value_str
-
-    return value_str
+    full_text = ''.join(normalized_lines)
+    return _extract_diff_from_text(full_text)
 
 
 def _is_valid_stock_code(code_str):
@@ -248,6 +301,15 @@ def detect_groups(img_dir):
     return max(groups) if groups else 0
 
 
+def _resolve_image_path(img_dir, group_index, image_kind):
+    """解析图片路径，兼容 .png.bmp 和 .bmp 两种命名。"""
+    for suffix in ('.png.bmp', '.bmp'):
+        path = os.path.join(img_dir, f'{group_index}_{image_kind}{suffix}')
+        if os.path.exists(path):
+            return path
+    return ''
+
+
 def process_images(img_dir, output_path, progress_callback=None):
     """
     主处理函数：批量识别图片并写入Excel
@@ -262,7 +324,7 @@ def process_images(img_dir, output_path, progress_callback=None):
     """
     group_count = detect_groups(img_dir)
     if group_count == 0:
-        return False, "未在指定目录中找到图片文件（格式：N_差额.png.bmp）"
+        return False, "未在指定目录中找到图片文件（格式：N_差额.png.bmp 或 N_差额.bmp）"
 
     ocr_engine = create_ocr()
     results = []
@@ -272,9 +334,9 @@ def process_images(img_dir, output_path, progress_callback=None):
         step_base = (i - 1) * 3
 
         # --- 差额（使用带坐标的OCR结果+颜色检测） ---
-        diff_path = os.path.join(img_dir, f'{i}_差额.png.bmp')
+        diff_path = _resolve_image_path(img_dir, i, '差额')
         diff_value = ''
-        if os.path.exists(diff_path):
+        if diff_path:
             if progress_callback:
                 progress_callback(step_base + 1, total_steps, f'正在识别 第{i}组 差额...')
             try:
@@ -285,9 +347,9 @@ def process_images(img_dir, output_path, progress_callback=None):
                 diff_value = f'识别失败: {e}'
 
         # --- 代码 ---
-        code_path = os.path.join(img_dir, f'{i}_代码.png.bmp')
+        code_path = _resolve_image_path(img_dir, i, '代码')
         name, code = '', ''
-        if os.path.exists(code_path):
+        if code_path:
             if progress_callback:
                 progress_callback(step_base + 2, total_steps, f'正在识别 第{i}组 代码...')
             try:
@@ -297,9 +359,9 @@ def process_images(img_dir, output_path, progress_callback=None):
                 name = f'识别失败: {e}'
 
         # --- 市值 ---
-        value_path = os.path.join(img_dir, f'{i}_市值.png.bmp')
+        value_path = _resolve_image_path(img_dir, i, '市值')
         market_cap = ''
-        if os.path.exists(value_path):
+        if value_path:
             if progress_callback:
                 progress_callback(step_base + 3, total_steps, f'正在识别 第{i}组 市值...')
             try:

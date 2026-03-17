@@ -39,3 +39,4 @@ pics.zip
 
 # Optional: ignore local dataset folder if not for version control
 pics/
+test_case

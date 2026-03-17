@@ -239,7 +239,8 @@ class OCRApp:
         if group_count == 0:
             messagebox.showerror("错误",
                                  f"目录中未找到有效图片文件\n"
-                                 f"（格式：N_差额.png.bmp / N_代码.png.bmp / N_市值.png.bmp）\n\n"
+                                 f"（格式：N_差额.png.bmp 或 N_差额.bmp）\n"
+                                 f"（代码/市值文件同样支持上述两种命名）\n\n"
                                  f"目录：{img_dir}")
             return
 
